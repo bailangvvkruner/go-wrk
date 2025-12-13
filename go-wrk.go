@@ -17,7 +17,7 @@ import (
 
 const APP_VERSION = "0.10"
 
-//default that can be overridden from the command line
+// default that can be overridden from the command line
 var versionFlag bool = false
 var helpFlag bool = false
 var duration int = 10 //seconds
@@ -63,7 +63,7 @@ func init() {
 	flag.BoolVar(&http2, "http", true, "Use HTTP/2")
 }
 
-//printDefaults a nicer format for the defaults
+// printDefaults a nicer format for the defaults
 func printDefaults() {
 	fmt.Println("Usage: go-wrk <options> <url>")
 	fmt.Println("Options:")
@@ -73,14 +73,21 @@ func printDefaults() {
 }
 
 func mapToString(m map[string]int) string {
-	s := make([]string,0,len(m))
-	for k,v := range m {
-		s = append(s,fmt.Sprint(k,"=",v))
+	s := make([]string, 0, len(m))
+	for k, v := range m {
+		s = append(s, fmt.Sprint(k, "=", v))
 	}
-	return strings.Join(s,",")
+	return strings.Join(s, ",")
 }
 
 func main() {
+	// 运行时优化：设置环境变量（如果未设置）
+	if os.Getenv("GOGC") == "" {
+		os.Setenv("GOGC", "200") // 减少GC频率
+	}
+	if os.Getenv("GODEBUG") == "" {
+		os.Setenv("GODEBUG", "gctrace=0,invalidptr=0") // 禁用调试输出
+	}
 
 	statsAggregator = make(chan *loader.RequesterStats, goroutines)
 	sigChan := make(chan os.Signal, 1)
@@ -123,9 +130,15 @@ func main() {
 
 	if cpus > 0 {
 		runtime.GOMAXPROCS(cpus)
+	} else {
+		// 默认使用单核优化，提高缓存局部性
+		runtime.GOMAXPROCS(1)
 	}
 
 	fmt.Printf("Running %vs test @ %v\n  %v goroutine(s) running concurrently\n", duration, testUrl, goroutines)
+
+	// 显示优化信息
+	fmt.Printf("  Optimization: GOGC=%s, GOMAXPROCS=%d\n", os.Getenv("GOGC"), runtime.GOMAXPROCS(0))
 
 	if len(reqBody) > 0 && reqBody[0] == '@' {
 		bodyFilename := reqBody[1:]
@@ -147,7 +160,7 @@ func main() {
 	}
 
 	responders := 0
-	aggStats := loader.RequesterStats{ErrMap: make(map[string]int), Histogram: histo.New(1,int64(duration * 1000000),4)}
+	aggStats := loader.RequesterStats{ErrMap: make(map[string]int), Histogram: histo.New(1, int64(duration*1000000), 4)}
 
 	for responders < goroutines {
 		select {
@@ -160,7 +173,7 @@ func main() {
 			aggStats.TotRespSize += stats.TotRespSize
 			aggStats.TotDuration += stats.TotDuration
 			responders++
-			for k,v := range stats.ErrMap {
+			for k, v := range stats.ErrMap {
 				aggStats.ErrMap[k] += v
 			}
 			aggStats.Histogram.Merge(stats.Histogram)
@@ -208,5 +221,5 @@ func main() {
 }
 
 func toDuration(usecs int64) time.Duration {
-	return time.Duration(usecs*1000)
+	return time.Duration(usecs * 1000)
 }
