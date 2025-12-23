@@ -74,47 +74,69 @@ func NewLoadCfg(duration int, // seconds
 	return
 }
 
-// urlCache URL转义结果缓存
+// 优化1：无锁URL缓存 - 使用线程局部存储+全局缓存
 var (
-	urlCache   = make(map[string]string)
-	urlCacheMu sync.RWMutex
+	// 全局缓存（带锁）
+	globalURLCache   = make(map[string]string)
+	globalURLCacheMu sync.RWMutex
+
+	// 线程局部缓存池（无锁）
+	threadLocalCachePool = sync.Pool{
+		New: func() interface{} {
+			return make(map[string]string)
+		},
+	}
 )
 
-// requestPool 请求对象池
+// 优化2：请求对象池
 var requestPool = sync.Pool{
 	New: func() interface{} {
-		return &http.Request{}
+		return &http.Request{
+			Header: make(http.Header),
+		}
 	},
 }
 
-// bufferPool 缓冲区池
+// 优化3：缓冲区池
 var bufferPool = sync.Pool{
 	New: func() interface{} {
 		return bytes.NewBuffer(make([]byte, 0, 4096))
 	},
 }
 
-const maxBodySize = 1024 * 1024 // 1MB，限制响应体最大读取大小
+const maxBodySize = 1024 * 1024 // 1MB
 
+// 优化后的URL转义函数
 func escapeUrlStr(in string) string {
-	// 检查缓存
-	urlCacheMu.RLock()
-	cached, found := urlCache[in]
-	urlCacheMu.RUnlock()
-
+	// 1. 尝试从线程局部缓存获取
+	threadCache := threadLocalCachePool.Get().(map[string]string)
+	cached, found := threadCache[in]
 	if found {
+		threadLocalCachePool.Put(threadCache)
 		return cached
 	}
 
-	// 缓存未命中，进行计算
+	// 2. 尝试从全局缓存获取（读锁）
+	globalURLCacheMu.RLock()
+	cached, found = globalURLCache[in]
+	globalURLCacheMu.RUnlock()
+	
+	if found {
+		// 存入线程局部缓存以便下次快速访问
+		threadCache[in] = cached
+		threadLocalCachePool.Put(threadCache)
+		return cached
+	}
+
+	// 3. 缓存未命中，进行计算
+	var result string
 	qm := strings.Index(in, "?")
 	if qm != -1 {
 		qry := in[qm+1:]
 		qrys := strings.Split(qry, "&")
 
-		// 使用strings.Builder提高性能
 		var query strings.Builder
-		query.Grow(len(in) + 20) // 预分配空间
+		query.Grow(len(in) + 20)
 
 		first := true
 		for _, q := range qrys {
@@ -137,49 +159,85 @@ func escapeUrlStr(in string) string {
 				query.WriteString(qSplit[0])
 			}
 		}
-
-		result := in[:qm] + "?" + query.String()
-
-		// 存入缓存
-		urlCacheMu.Lock()
-		urlCache[in] = result
-		urlCacheMu.Unlock()
-
-		return result
+		result = in[:qm] + "?" + query.String()
 	} else {
-		// 没有查询参数，直接缓存原字符串
-		urlCacheMu.Lock()
-		urlCache[in] = in
-		urlCacheMu.Unlock()
-		return in
+		result = in
 	}
+
+	// 4. 更新缓存（先更新全局，再更新线程局部）
+	globalURLCacheMu.Lock()
+	globalURLCache[in] = result
+	globalURLCacheMu.Unlock()
+
+	threadCache[in] = result
+	threadLocalCachePool.Put(threadCache)
+
+	return result
 }
 
-// DoRequest single request implementation. Returns the size of the response and its duration
-// On error - returns -1 on both
+// 优化4：客户端连接池配置
+func createOptimizedClient(disableCompression, disableKeepAlive, skipVerify bool,
+	timeoutms int, allowRedirects bool, clientCert, clientKey, caCert string, http2 bool) (*http.Client, error) {
+	
+	transport := &http.Transport{
+		DisableCompression:    disableCompression,
+		DisableKeepAlives:     disableKeepAlive,
+		TLSClientConfig:       util.CreateTLSConfig(clientCert, clientKey, caCert, skipVerify),
+		MaxIdleConnsPerHost:   100,           // 增加每个主机空闲连接数
+		IdleConnTimeout:       90 * time.Second, // 延长空闲连接超时
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Duration(timeoutms) * time.Millisecond,
+	}
+	
+	if !allowRedirects {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+	
+	return client, nil
+}
+
+// 优化后的请求函数
 func DoRequest(httpClient *http.Client, header map[string]string, method, host, loadUrl, reqBody string) (respSize int, duration time.Duration, err error) {
 	respSize = -1
 	duration = -1
 
 	loadUrl = escapeUrlStr(loadUrl)
 
-	var requestBody io.Reader
-	if len(reqBody) > 0 {
-		requestBody = bytes.NewBufferString(reqBody)
-	}
+	// 从对象池获取请求对象
+	req := requestPool.Get().(*http.Request)
+	defer requestPool.Put(req)
 
-	// 创建请求（不使用对象池，因为http.NewRequest内部结构复杂）
-	req, err := http.NewRequest(method, loadUrl, requestBody)
+	// 重置请求对象
+	req.Method = method
+	req.URL, err = url.Parse(loadUrl)
 	if err != nil {
 		return 0, 0, err
 	}
-
-	// 设置请求头
-	for hk, hv := range header {
-		req.Header.Set(hk, hv) // 使用Set而不是Add，避免重复添加
+	
+	// 设置请求体
+	if len(reqBody) > 0 {
+		req.Body = io.NopCloser(bytes.NewBufferString(reqBody))
+		req.ContentLength = int64(len(reqBody))
+	} else {
+		req.Body = nil
+		req.ContentLength = 0
 	}
-
+	
+	// 设置请求头（复用Header map）
+	for k := range req.Header {
+		delete(req.Header, k)
+	}
+	for hk, hv := range header {
+		req.Header.Set(hk, hv)
+	}
 	req.Header.Set("User-Agent", USER_AGENT)
+	
 	if host != "" {
 		req.Host = host
 	}
@@ -187,36 +245,31 @@ func DoRequest(httpClient *http.Client, header map[string]string, method, host, 
 	start := time.Now()
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		// this is a bit weird. When redirection is prevented, a url.Error is retuned. This creates an issue to distinguish
-		// between an invalid URL that was provided and and redirection error.
-		_, ok := err.(*url.Error)
-		if !ok {
+		// 对于重定向错误，返回0大小和持续时间以便统计
+		if _, ok := err.(*url.Error); ok && !strings.Contains(err.Error(), "redirect") {
 			return 0, 0, err
 		}
-		return 0, 0, err
+		// 重定向错误仍然记录持续时间
+		duration = time.Since(start)
+		return 0, duration, nil
 	}
 	if resp == nil {
 		return 0, 0, errors.New("empty response")
 	}
-	defer func() {
-		if resp != nil && resp.Body != nil {
-			resp.Body.Close()
-		}
-	}()
+	defer resp.Body.Close()
 
 	// 使用缓冲区池读取响应体
 	responseBuffer := bufferPool.Get().(*bytes.Buffer)
 	responseBuffer.Reset()
 	defer bufferPool.Put(responseBuffer)
 
-	// 限制读取大小，避免大响应体导致内存问题
 	limitedReader := io.LimitReader(resp.Body, maxBodySize)
 	bodySize, err := responseBuffer.ReadFrom(limitedReader)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	if resp.StatusCode/100 == 2 { // Treat all 2XX as successful
+	if resp.StatusCode/100 == 2 { // 所有2XX视为成功
 		duration = time.Since(start)
 		respSize = int(bodySize) + int(util.EstimateHttpHeadersSize(resp.Header))
 	} else if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect {
@@ -236,18 +289,20 @@ func unwrap(err error) error {
 	return err
 }
 
-// Requester a go function for repeatedly making requests and aggregating statistics as long as required
-// When it is done, it sends the results using the statsAggregator channel
+// 优化的负载生成会话
 func (cfg *LoadCfg) RunSingleLoadSession() {
+	// 优化5：为每个goroutine创建独立的统计对象，减少锁竞争
 	stats := &RequesterStats{ErrMap: make(map[string]int), Histogram: histo.New(1, int64(cfg.duration*1000000), 4)}
 	start := time.Now()
 
-	httpClient, err := client(cfg.disableCompression, cfg.disableKeepAlive, cfg.skipVerify,
+	// 使用优化的客户端创建函数
+	httpClient, err := createOptimizedClient(cfg.disableCompression, cfg.disableKeepAlive, cfg.skipVerify,
 		cfg.timeoutms, cfg.allowRedirects, cfg.clientCert, cfg.clientKey, cfg.caCert, cfg.http2)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// 主请求循环
 	for time.Since(start).Seconds() <= float64(cfg.duration) && atomic.LoadInt32(&cfg.interrupted) == 0 {
 		respSize, reqDur, err := DoRequest(httpClient, cfg.header, cfg.method, cfg.host, cfg.testUrl, cfg.reqBody)
 		if err != nil {
@@ -262,6 +317,8 @@ func (cfg *LoadCfg) RunSingleLoadSession() {
 			stats.NumErrs++
 		}
 	}
+	
+	// 发送统计结果
 	cfg.statsAggregator <- stats
 }
 
