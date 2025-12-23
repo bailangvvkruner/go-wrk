@@ -1,17 +1,8 @@
 package loader
 
 import (
-	"crypto/tls"
-	"crypto/x509"
-	"fmt"
-	"io/ioutil"
 	"net/http"
 	"sync"
-
-	"time"
-
-	"github.com/tsliwowicz/go-wrk/util"
-	"golang.org/x/net/http2"
 )
 
 // clientCacheKey 用于标识客户端配置的唯一键

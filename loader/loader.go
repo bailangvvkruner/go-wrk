@@ -2,9 +2,12 @@ package loader
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	histo "github.com/HdrHistogram/hdrhistogram-go"
+	"golang.org/x/net/http2"
 	"github.com/tsliwowicz/go-wrk/util"
 )
 
@@ -175,17 +179,82 @@ func escapeUrlStr(in string) string {
 	return result
 }
 
-// 优化4：客户端连接池配置
+// 优化4：客户端连接池配置（支持TLS证书）
 func createOptimizedClient(disableCompression, disableKeepAlive, skipVerify bool,
-	timeoutms int, allowRedirects bool, clientCert, clientKey, caCert string, http2 bool) (*http.Client, error) {
+	timeoutms int, allowRedirects bool, clientCert, clientKey, caCert string, usehttp2 bool) (*http.Client, error) {
 	
+	// 创建基本传输配置
 	transport := &http.Transport{
 		DisableCompression:    disableCompression,
 		DisableKeepAlives:     disableKeepAlive,
-		TLSClientConfig:       util.CreateTLSConfig(clientCert, clientKey, caCert, skipVerify),
 		MaxIdleConnsPerHost:   100,           // 增加每个主机空闲连接数
 		IdleConnTimeout:       90 * time.Second, // 延长空闲连接超时
 		ExpectContinueTimeout: 1 * time.Second,
+	}
+	
+	// 配置TLS
+	if skipVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	} else {
+		transport.TLSClientConfig = nil
+	}
+	
+	// 处理客户端证书
+	if clientCert != "" || clientKey != "" || caCert != "" {
+		if clientCert == "" {
+			return nil, fmt.Errorf("client certificate can't be empty")
+		}
+		if clientKey == "" {
+			return nil, fmt.Errorf("client key can't be empty")
+		}
+		
+		// 加载客户端证书
+		cert, err := tls.LoadX509KeyPair(clientCert, clientKey)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to load cert tried to load %v and %v but got %v", clientCert, clientKey, err)
+		}
+		
+		var tlsConfig *tls.Config
+		if skipVerify {
+			tlsConfig = &tls.Config{
+				Certificates:       []tls.Certificate{cert},
+				InsecureSkipVerify: true,
+			}
+		} else {
+			tlsConfig = &tls.Config{
+				Certificates: []tls.Certificate{cert},
+			}
+			
+			// 如果提供了CA证书，加载它
+			if caCert != "" {
+				clientCACert, err := ioutil.ReadFile(caCert)
+				if err != nil {
+					return nil, fmt.Errorf("Unable to open cert %v", err)
+				}
+				clientCertPool := x509.NewCertPool()
+				clientCertPool.AppendCertsFromPEM(clientCACert)
+				tlsConfig.RootCAs = clientCertPool
+			}
+		}
+		
+		// 创建新的传输配置
+		t := &http.Transport{
+			TLSClientConfig:       tlsConfig,
+			DisableCompression:    disableCompression,
+			DisableKeepAlives:     disableKeepAlive,
+			MaxIdleConnsPerHost:   100,
+			IdleConnTimeout:       90 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+		
+		// 配置HTTP/2
+		if usehttp2 {
+			http2.ConfigureTransport(t)
+		}
+		transport = t
+	} else if usehttp2 {
+		// 如果没有证书但需要HTTP/2
+		http2.ConfigureTransport(transport)
 	}
 
 	client := &http.Client{
